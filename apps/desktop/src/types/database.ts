@@ -635,6 +635,7 @@ export interface QueryResultRun {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  batchSqlExecution?: BatchSqlExecution;
   resultBaseSql?: string;
   /** Fingerprint of the complete editor document when this result run started. */
   resultEditorFingerprint?: string;

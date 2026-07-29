@@ -181,6 +181,45 @@ describe("queryStore multi-statement errors", () => {
     });
   });
 
+  it("records a top-level batch failure on the current statement", async () => {
+    mocks.executeMultiWithProgress.mockRejectedValueOnce(new Error("transport failed"));
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2");
+
+    await store.executeTabSql(tabId, "SELECT 1;\nSELECT 2");
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 1,
+      items: [{ status: "error", error: "transport failed" }, { status: "skipped" }],
+    });
+  });
+
+  it("keeps completed progress and records a later top-level batch failure", async () => {
+    mocks.executeMultiWithProgress.mockImplementationOnce((_connectionId, _database, _sql, onProgress, _schema, options) => {
+      onProgress({
+        executionId: options?.executionId,
+        statementIndex: 0,
+        completed: 1,
+        total: 3,
+        success: true,
+        executionTimeMs: 4,
+        affectedRows: 1,
+      });
+      return Promise.reject(new Error("connection lost"));
+    });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2;\nSELECT 3");
+
+    await store.executeTabSql(tabId, "SELECT 1;\nSELECT 2;\nSELECT 3");
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 2,
+      items: [{ status: "success" }, { status: "error", error: "connection lost" }, { status: "skipped" }],
+    });
+  });
+
   it("updates the live marker state for a single statement", async () => {
     const pendingExecution = deferred<any[]>();
     mocks.executeMulti.mockImplementationOnce(() => pendingExecution.promise);
@@ -559,19 +598,37 @@ describe("queryStore multi-statement errors", () => {
     const tab = store.tabs.find((item) => item.id === tabId)!;
     const retainedRunId = tab.activeResultRunId!;
     const retainedRunCacheKey = tab.resultRuns?.find((run) => run.id === retainedRunId)?.resultCacheKey;
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
 
     const execution = store.executeCurrentSql("SELECT 2 AS value", { openInNewResultTab: true });
     await vi.waitFor(() => expect(mocks.executeMulti).toHaveBeenCalledTimes(2));
     expect(await store.setActiveResultRun(tabId, retainedRunId)).toBe(true);
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
     pendingExecution.resolve([{ columns: ["value"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]);
     await execution;
 
     expect(tab.resultRuns).toHaveLength(2);
     expect(tab.activeResultRunId).not.toBe(retainedRunId);
     expect(tab.result).toMatchObject({ rows: [[2]] });
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 2 AS value");
     expect(tab.resultRuns?.find((run) => run.id === tab.activeResultRunId)?.resultCacheKey).not.toBe(retainedRunCacheKey);
     expect(await store.setActiveResultRun(tabId, retainedRunId)).toBe(true);
     expect(tab.result).toMatchObject({ rows: [[1]] });
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
+
+    const newRunId = tab.resultRuns?.find((run) => run.id !== retainedRunId)?.id;
+    expect(newRunId).toBeTruthy();
+    expect(await store.setActiveResultRun(tabId, newRunId!)).toBe(true);
+    await vi.waitFor(() => expect(mocks.tabResultSnapshots.has(retainedRunCacheKey!)).toBe(true));
+    const retainedRun = tab.resultRuns?.find((run) => run.id === retainedRunId);
+    expect(retainedRun).toBeTruthy();
+    retainedRun!.result = undefined;
+    retainedRun!.results = undefined;
+    retainedRun!.batchSqlExecution = undefined;
+
+    expect(await store.setActiveResultRun(tabId, retainedRunId)).toBe(true);
+    expect(tab.result).toMatchObject({ rows: [[1]] });
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
   });
 
   it("restores the retained result when a new-result execution returns no result", async () => {
